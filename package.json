@@ -5,6 +5,7 @@
   "scripts": {
     "start": "bun src/cli.ts",
     "build": "bun build src/client/index.tsx --target browser --minify --outdir dist/assets",
+    "package": "bun run build && bun build --compile --target=bun-linux-x64 --asset ./dist/assets --no-compile-autoload-dotenv --no-compile-autoload-bunfig src/cli.ts --outfile dist/files-linux-x64 && bun build --compile --target=bun-linux-arm64 --asset ./dist/assets --no-compile-autoload-dotenv --no-compile-autoload-bunfig src/cli.ts --outfile dist/files-linux-arm64",
     "test": "bun test",
     "typecheck": "tsc --noEmit"
   },

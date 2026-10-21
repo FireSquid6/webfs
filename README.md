@@ -12,9 +12,12 @@ bun test
 bun run build
 bun run start -- --config ./config.yaml
 bun run start -- --config ./config.yaml --lan
+bun run package
+./dist/files-linux-x64 --config ./config.yaml
+# On a Linux ARM64 host: ./dist/files-linux-arm64 --config ./config.yaml
 ```
 
-Open `http://127.0.0.1:3000/` (or your configured port). **Build before starting** and rebuild after changing the frontend. The installable PWA manifest and network-only service worker do not store offline content. Use a secure context (localhost or HTTPS) to install from your browser. This stage does not yet package a single-file Linux executable; the `dist/assets` bundle is required at runtime.
+Open `http://127.0.0.1:3000/` (or your configured port). For development with `bun run start`, **build before starting** and rebuild after changing the frontend; this mode serves `dist/assets` from disk. `bun run package` builds the frontend with Bun (no Vite) and cross-compiles standalone Linux glibc x64 and ARM64 executables in `dist/`. Copy only the executable for your architecture to the server: it includes Bun, the API, JavaScript and CSS, with no need for Bun, `dist/assets`, or source files at runtime. Supply a separate YAML config with `--config`; relative config paths resolve from the working directory, while relative `root` paths resolve from the config's directory. ARM64 binaries are produced by cross-compilation; run them on an ARM64 host to verify execution. The installable PWA manifest and network-only service worker do not store offline content. Use a secure context (localhost or HTTPS) to install from your browser.
 
 `bun test` includes a headless Chromium regression; install its browser with the command above (and platform dependencies, if Chromium reports missing libraries). The UI supports keyboard navigation through native controls and dialogs, including a folder picker for moves, file chooser for uploads, trash restore, and deliberate overwrite choices. Editor find/replace is Ctrl/Cmd+F / Ctrl/Cmd+H; the toolbar contains Save and a persisted Vim-mode toggle. Markdown preview intentionally renders raw HTML without sanitizing it: **opening untrusted Markdown can execute scripts in the app origin**. Use only on a trusted private network and with trusted files.
 

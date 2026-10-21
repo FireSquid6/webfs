@@ -18,6 +18,12 @@ const string = (value: unknown, name: string): string => {
 
 export function handler(config: Config): (request: Request) => Promise<Response> {
   const files = new Files(config);
+  const embeddedAssets = Bun.isStandaloneExecutable
+    ? new Map((Bun.embeddedFiles as (Blob & { name: string })[]).filter(file => file.name === 'assets/index.js' || file.name === 'assets/index.css').map(file => [file.name, file]))
+    : null;
+  if (embeddedAssets && (!embeddedAssets.has('assets/index.js') || !embeddedAssets.has('assets/index.css'))) {
+    throw new Error('Compiled executable is missing frontend assets');
+  }
   return async request => {
     try {
       const url = new URL(request.url);
@@ -29,8 +35,10 @@ export function handler(config: Config): (request: Request) => Promise<Response>
       if (method === 'GET' && route === '/icon.svg') return new Response('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128"><rect width="128" height="128" rx="22" fill="#17324a"/><path d="M20 42h38l11 12h39v43H20z" fill="#65d6c0"/></svg>', { headers: { 'Content-Type': 'image/svg+xml', 'Cache-Control': 'no-store' } });
       if (method === 'GET' && route === '/sw.js') return new Response("self.addEventListener('install', () => self.skipWaiting()); self.addEventListener('activate', event => event.waitUntil(self.clients.claim())); self.addEventListener('fetch', event => event.respondWith(fetch(event.request)));", { headers: { 'Content-Type': 'text/javascript', 'Cache-Control': 'no-store' } });
       if (method === 'GET' && /^\/assets\/[\w.-]+\.(js|css)$/.test(route)) {
-        const file = Bun.file(path.resolve(import.meta.dir, '../../dist', route.slice(1)));
-        if (await file.exists()) return new Response(file, { headers: { 'Content-Type': route.endsWith('.css') ? 'text/css; charset=utf-8' : 'text/javascript; charset=utf-8', 'Cache-Control': 'no-store' } });
+        const file = embeddedAssets
+          ? embeddedAssets.get(route.slice(1))
+          : Bun.file(path.resolve(import.meta.dir, '../../dist', route.slice(1)));
+        if (file && (embeddedAssets || await (file as ReturnType<typeof Bun.file>).exists())) return new Response(file, { headers: { 'Content-Type': route.endsWith('.css') ? 'text/css; charset=utf-8' : 'text/javascript; charset=utf-8', 'Cache-Control': 'no-store' } });
       }
       if (route === '/api/config' && method === 'GET') return json({ limits: config.limits, trash: !!config.trash });
       if (route === '/api/list' && method === 'GET') return json(await files.list(p()));
