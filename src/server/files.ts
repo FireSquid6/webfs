@@ -74,7 +74,12 @@ export class Files {
 
   private async readable(input: string): Promise<{ target: string; info: Stats }> {
     const lexical = this.lexical(input);
-    const target = await realpath(lexical);
+    let target: string;
+    try { target = await realpath(lexical); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ELOOP') return fail(400, 'SYMLINK_LOOP', 'Symlink cannot be opened because it loops');
+      throw error;
+    }
     if (!this.inside(target) || this.protected(target)) return fail(403, 'OUTSIDE_ROOT', 'Target resolves outside root or into trash');
     return { target, info: await stat(target) };
   }
@@ -101,9 +106,9 @@ export class Files {
       let outside = false, dangling = false;
       try { const resolved = await realpath(target); outside = !this.inside(resolved) || this.protected(resolved); }
       catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-        dangling = true;
-        outside = await this.danglingOutside(path.resolve(path.dirname(target), raw));
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code !== 'ENOENT' && code !== 'ELOOP') throw error;
+        ({ outside, dangling } = await this.unopenableLink(path.dirname(target), raw));
       }
       link = { target: raw, outside, dangling };
     }
@@ -111,22 +116,42 @@ export class Files {
       size: info.size, modified: info.mtime.toISOString(), link };
   }
 
-  private async danglingOutside(candidate: string, visited = new Set<string>()): Promise<boolean> {
-    if (!this.inside(candidate) || this.protected(candidate)) return true;
-    if (visited.has(candidate)) return true;
-    visited.add(candidate);
-    try {
-      const info = await lstat(candidate);
-      if (info.isSymbolicLink()) {
-        const raw = await readlink(candidate);
-        return this.danglingOutside(path.resolve(path.dirname(candidate), raw), visited);
+  private async unopenableLink(parent: string, raw: string): Promise<{ outside: boolean; dangling: boolean }> {
+    // Walk each component in filesystem order: resolving `in/../missing` with
+    // path.resolve first would incorrectly erase the symlink named `in`.
+    let current = raw.startsWith('/') ? '/' : parent;
+    const pending = raw.split('/');
+    let links = 0;
+    let missing = false;
+    while (pending.length) {
+      const component = pending.shift()!;
+      if (!component || component === '.') continue;
+      if (component === '..') { current = path.dirname(current); continue; }
+      const candidate = path.join(current, component);
+      if (!this.inside(candidate) || this.protected(candidate)) {
+        // Classify the remaining path without inspecting entries outside the root.
+        missing = true;
+        current = candidate;
+        continue;
       }
-      return false;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-      if (candidate === this.config.root) return false;
-      return this.danglingOutside(path.dirname(candidate), visited);
+      if (!missing) {
+        try {
+          const info = await lstat(candidate);
+          if (info.isSymbolicLink()) {
+            if (++links > 40) return { outside: !this.inside(current) || this.protected(current), dangling: true };
+            const next = await readlink(candidate);
+            if (next.startsWith('/')) current = '/';
+            pending.unshift(...next.split('/'));
+            continue;
+          }
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+          missing = true;
+        }
+      }
+      current = candidate;
     }
+    return { outside: !this.inside(current) || this.protected(current), dangling: missing };
   }
 
   async list(input: string) {

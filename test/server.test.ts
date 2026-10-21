@@ -80,6 +80,27 @@ describe('confinement and symlinks', () => {
     }
     expect((await call(query('/api/text', 'internal'))).status).toBe(404);
   });
+  test('lists looping symlinks without failing the directory listing', async () => {
+    await symlink('loop', path.join(root, 'loop'));
+    const listing = await call(query('/api/list', ''));
+    expect(listing.status).toBe(200);
+    expect(listing.data.entries).toHaveLength(1);
+    expect(listing.data.entries[0].kind).toBe('symlink');
+    expect(listing.data.entries[0].link).toEqual({ target: 'loop', outside: false, dangling: true });
+    const opened = await call(query('/api/list', 'loop'));
+    expect(opened.status).toBe(400);
+    expect(opened.data.error.code).toBe('SYMLINK_LOOP');
+  });
+  test('resolves intermediate symlinks before dot-dot for missing targets', async () => {
+    await symlink('../outside', path.join(root, 'in'));
+    await symlink('in/../missing', path.join(root, 'link'));
+    const meta = await call(query('/api/metadata', 'link'));
+    expect(meta.status).toBe(200);
+    expect(meta.data.link).toEqual({ target: 'in/../missing', outside: true, dangling: true });
+    const listing = await call(query('/api/list', ''));
+    expect(listing.status).toBe(200);
+    expect(listing.data.entries.find((entry: any) => entry.name === 'link').link.outside).toBe(true);
+  });
   test('supports POSIX backslash names in browsing and mutations without allowing traversal', async () => {
     await writeFile(path.join(root, 'a\\b'), 'existing');
     expect((await call(query('/api/list', ''))).data.entries.map((item: any) => item.name)).toContain('a\\b');
