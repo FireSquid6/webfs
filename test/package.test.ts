@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { chromium } from 'playwright';
 
-test('packaged Linux executables: x64 runs independently with UI and API, ARM64 is produced', async () => {
+test('packaged Linux executables: native architecture runs independently with UI and API, other architecture is produced', async () => {
   const project = path.resolve(import.meta.dir, '..');
   const work = await mkdtemp(path.join(os.tmpdir(), 'files-package-'));
   let app: ReturnType<typeof Bun.spawn> | undefined;
@@ -14,9 +14,12 @@ test('packaged Linux executables: x64 runs independently with UI and API, ARM64 
     const [code, stdout, stderr] = await Promise.all([build.exited, new Response(build.stdout).text(), new Response(build.stderr).text()]);
     if (code !== 0) throw new Error(`Packaging failed:\n${stdout}\n${stderr}`);
 
-    const arm = await readFile(path.join(project, 'dist/files-linux-arm64'));
-    expect(arm.subarray(0, 4).toString('hex')).toBe('7f454c46');
-    expect(arm.readUInt16LE(18)).toBe(183); // ELF AArch64
+    if (process.arch !== 'x64' && process.arch !== 'arm64') throw new Error(`Unsupported test host architecture: ${process.arch}`);
+    const nativeArch = process.arch;
+    const otherArch = nativeArch === 'x64' ? 'arm64' : 'x64';
+    const other = await readFile(path.join(project, `dist/files-linux-${otherArch}`));
+    expect(other.subarray(0, 4).toString('hex')).toBe('7f454c46');
+    expect(other.readUInt16LE(18)).toBe(otherArch === 'arm64' ? 183 : 62); // ELF AArch64 or x86-64
 
     const deploy = path.join(work, 'deploy');
     const elsewhere = path.join(work, 'elsewhere');
@@ -25,7 +28,7 @@ test('packaged Linux executables: x64 runs independently with UI and API, ARM64 
     await mkdir(path.join(work, 'data'));
     await writeFile(path.join(work, 'data', 'packaged.txt'), 'Hello from the packaged executable');
     const executable = path.join(deploy, 'files');
-    await copyFile(path.join(project, 'dist/files-linux-x64'), executable);
+    await copyFile(path.join(project, `dist/files-linux-${nativeArch}`), executable);
     const port = await new Promise<number>((resolve, reject) => {
       const listener = createServer();
       listener.once('error', reject);
