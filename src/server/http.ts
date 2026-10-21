@@ -27,6 +27,7 @@ export function handler(config: Config): (request: Request) => Promise<Response>
       if (route === '/api/list' && method === 'GET') return json(await files.list(p()));
       if (route === '/api/metadata' && method === 'GET') return json(await files.describe(p()));
       if (route === '/api/text' && method === 'GET') return json(await files.text(p()));
+      if (route === '/api/text-preview' && method === 'GET') return json(await files.previewText(p()));
       if ((route === '/api/raw' || route === '/api/preview') && method === 'GET') {
         const { target, info } = await files.file(p(), route === '/api/preview' ? config.limits.preview : undefined);
         const type = mime.getType(target) ?? 'application/octet-stream';
@@ -45,33 +46,33 @@ export function handler(config: Config): (request: Request) => Promise<Response>
       }
       if (route === '/api/save' && method === 'PUT') {
         const data = await body(request);
-        return json(await files.save(string(data.path, 'path'), string(data.content, 'content'), string(data.version, 'version'), data.overwrite === true));
+        return json(await files.mutate(() => files.save(string(data.path, 'path'), string(data.content, 'content'), string(data.version, 'version'), data.overwrite === true)));
       }
       if (route === '/api/create' && method === 'POST') {
         const data = await body(request);
-        return json(await files.create(string(data.path, 'path'), string(data.kind, 'kind') as 'file' | 'directory'), 201);
+        return json(await files.mutate(() => files.create(string(data.path, 'path'), string(data.kind, 'kind') as 'file' | 'directory')), 201);
       }
       if (route === '/api/move' && method === 'POST') {
         const data = await body(request);
-        return json(await files.move(string(data.source, 'source'), string(data.destination, 'destination'), data.overwrite === true));
+        return json(await files.mutate(() => files.move(string(data.source, 'source'), string(data.destination, 'destination'), data.overwrite === true)));
       }
       if (route === '/api/delete' && method === 'POST') {
         const data = await body(request);
-        return json(await files.delete(string(data.path, 'path'), data.confirmed === true));
+        return json(await files.mutate(() => files.delete(string(data.path, 'path'), data.confirmed === true)));
       }
       if (route === '/api/upload' && method === 'POST') {
         const directory = p();
         const form = await request.formData();
         const uploaded = form.getAll('files');
         if (uploaded.some(item => !(item instanceof File))) throw new ApiError(400, 'INVALID_INPUT', 'files must be file parts');
-        return json(await files.upload(directory, uploaded as File[], url.searchParams.get('overwrite') === 'true'), 201);
+        return json(await files.mutate(() => files.upload(directory, uploaded as File[], url.searchParams.get('overwrite') === 'true')), 201);
       }
       if (route === '/api/trash' && method === 'GET') return json(await files.trashList());
       const match = /^\/api\/trash\/([^/]+)\/(restore|purge)$/.exec(route);
       if (match && method === 'POST') {
         const data = await body(request);
-        if (match[2] === 'restore') return json(await files.restore(match[1]!, data.destination === undefined ? undefined : string(data.destination, 'destination')));
-        return json(await files.purge(match[1]!, data.confirmed === true));
+        if (match[2] === 'restore') return json(await files.mutate(() => files.restore(match[1]!, data.destination === undefined ? undefined : string(data.destination, 'destination'))));
+        return json(await files.mutate(() => files.purge(match[1]!, data.confirmed === true)));
       }
       return json({ error: { code: 'NOT_FOUND', message: 'Endpoint not found' } }, 404);
     } catch (error) {

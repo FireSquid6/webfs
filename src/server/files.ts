@@ -16,6 +16,17 @@ const fail = (status: number, code: string, message: string, details?: unknown):
 
 export class Files {
   constructor(readonly config: Config) {}
+  private mutationTail: Promise<void> = Promise.resolve();
+
+  // Shared by every mutation route in this server. Read-only requests remain concurrent.
+  async mutate<T>(work: () => Promise<T>): Promise<T> {
+    const previous = this.mutationTail;
+    let release!: () => void;
+    this.mutationTail = new Promise<void>(resolve => { release = resolve; });
+    await previous;
+    try { return await work(); }
+    finally { release(); }
+  }
 
   private inside(target: string): boolean {
     const relative = path.relative(this.config.root, target);
@@ -35,7 +46,7 @@ export class Files {
   private relative(target: string): string { return path.relative(this.config.root, target).split(path.sep).join('/'); }
 
   private lexical(input: string, allowTrash = false): string {
-    if (typeof input !== 'string' || input.includes('\0') || input.includes('\\') || input.startsWith('/') ||
+    if (typeof input !== 'string' || input.includes('\0') || input.startsWith('/') ||
         input.split('/').some(part => part === '..' || part === '.' || part === '')) {
       if (input === '') return this.config.root;
       return fail(400, 'INVALID_PATH', 'Use a root-relative path without dot or empty segments');
@@ -87,13 +98,35 @@ export class Files {
     let link: { target: string; outside: boolean; dangling: boolean } | undefined;
     if (info.isSymbolicLink()) {
       const raw = await readlink(target);
-      let outside = true, dangling = false;
+      let outside = false, dangling = false;
       try { const resolved = await realpath(target); outside = !this.inside(resolved) || this.protected(resolved); }
-      catch { dangling = true; }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+        dangling = true;
+        outside = await this.danglingOutside(path.resolve(path.dirname(target), raw));
+      }
       link = { target: raw, outside, dangling };
     }
     return { path: input, name: path.basename(target), kind: info.isSymbolicLink() ? 'symlink' : info.isDirectory() ? 'directory' : info.isFile() ? 'file' : 'other',
       size: info.size, modified: info.mtime.toISOString(), link };
+  }
+
+  private async danglingOutside(candidate: string, visited = new Set<string>()): Promise<boolean> {
+    if (!this.inside(candidate) || this.protected(candidate)) return true;
+    if (visited.has(candidate)) return true;
+    visited.add(candidate);
+    try {
+      const info = await lstat(candidate);
+      if (info.isSymbolicLink()) {
+        const raw = await readlink(candidate);
+        return this.danglingOutside(path.resolve(path.dirname(candidate), raw), visited);
+      }
+      return false;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      if (candidate === this.config.root) return false;
+      return this.danglingOutside(path.dirname(candidate), visited);
+    }
   }
 
   async list(input: string) {
@@ -113,9 +146,18 @@ export class Files {
   }
 
   async text(input: string) {
-    const { target, info } = await this.file(input, this.config.limits.edit);
+    return this.readText(input, this.config.limits.edit);
+  }
+
+  async previewText(input: string) {
+    const { path, content } = await this.readText(input, this.config.limits.preview);
+    return { path, content };
+  }
+
+  private async readText(input: string, limit: number) {
+    const { target, info } = await this.file(input, limit);
     const bytes = await readFile(target);
-    if (bytes.length > this.config.limits.edit) return fail(413, 'SIZE_LIMIT', 'File exceeds edit limit');
+    if (bytes.length > limit) return fail(413, 'SIZE_LIMIT', 'File exceeds text size limit');
     const content = this.decodeText(bytes);
     return { path: input, content, version: this.version(bytes, info) };
   }
@@ -192,7 +234,7 @@ export class Files {
   }
 
   private validName(name: string) {
-    if (!name || name === '.' || name === '..' || name.includes('/') || name.includes('\\') || name.includes('\0')) {
+    if (!name || name === '.' || name === '..' || name.includes('/') || name.includes('\0')) {
       return fail(400, 'INVALID_PATH', 'Invalid filename');
     }
   }
@@ -234,10 +276,15 @@ export class Files {
   async trashList() {
     if (!this.config.trash) return fail(400, 'TRASH_DISABLED', 'Trash is not configured');
     const ids = await readdir(this.config.trash);
-    return (await Promise.all(ids.filter(id => /^[0-9a-f-]{36}$/.test(id)).map(async id => {
-      try { const { folder, item, ...meta } = await this.trashEntry(id); const info = await lstat(item); return { ...meta, kind: info.isSymbolicLink() ? 'symlink' : info.isDirectory() ? 'directory' : 'file', size: info.size }; }
-      catch { return null; }
-    }))).filter(item => item !== null);
+    return Promise.all(ids.filter(id => /^[0-9a-f-]{36}$/.test(id)).map(async id => {
+      try {
+        const { folder, item, ...meta } = await this.trashEntry(id);
+        const info = await lstat(item);
+        return { ...meta, kind: info.isSymbolicLink() ? 'symlink' : info.isDirectory() ? 'directory' : 'file', size: info.size };
+      } catch (error) {
+        throw new ApiError(500, 'TRASH_DAMAGED', `Cannot read trash item ${id}`, { id, cause: (error as Error).message });
+      }
+    }));
   }
 
   async restore(id: string, destination?: string) {
