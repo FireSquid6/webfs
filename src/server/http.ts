@@ -1,6 +1,7 @@
 import mime from 'mime';
 import { ApiError, Files } from './files';
 import type { Config } from './config';
+import path from 'node:path';
 
 const json = (value: unknown, status = 200) => Response.json(value, { status, headers: { 'Cache-Control': 'no-store' } });
 const body = async (request: Request): Promise<Record<string, unknown>> => {
@@ -23,6 +24,14 @@ export function handler(config: Config): (request: Request) => Promise<Response>
       const route = url.pathname;
       const method = request.method;
       const p = () => string(url.searchParams.get('path'), 'path');
+      if (method === 'GET' && (route === '/' || route === '/index.html')) return new Response(`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="theme-color" content="#17324a"><link rel="manifest" href="/manifest.webmanifest"><link rel="stylesheet" href="/assets/index.css"><title>Files</title></head><body><div id="root"></div><script type="module" src="/assets/index.js"></script></body></html>`, { headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' } });
+      if (method === 'GET' && route === '/manifest.webmanifest') return Response.json({ name: 'Files', short_name: 'Files', start_url: '/', display: 'standalone', theme_color: '#17324a', background_color: '#f5f7fa', icons: [{ src: '/icon.svg', sizes: 'any', type: 'image/svg+xml', purpose: 'any maskable' }] }, { headers: { 'Content-Type': 'application/manifest+json', 'Cache-Control': 'no-store' } });
+      if (method === 'GET' && route === '/icon.svg') return new Response('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128"><rect width="128" height="128" rx="22" fill="#17324a"/><path d="M20 42h38l11 12h39v43H20z" fill="#65d6c0"/></svg>', { headers: { 'Content-Type': 'image/svg+xml', 'Cache-Control': 'no-store' } });
+      if (method === 'GET' && route === '/sw.js') return new Response("self.addEventListener('install', () => self.skipWaiting()); self.addEventListener('activate', event => event.waitUntil(self.clients.claim())); self.addEventListener('fetch', event => event.respondWith(fetch(event.request)));", { headers: { 'Content-Type': 'text/javascript', 'Cache-Control': 'no-store' } });
+      if (method === 'GET' && /^\/assets\/[\w.-]+\.(js|css)$/.test(route)) {
+        const file = Bun.file(path.resolve(import.meta.dir, '../../dist', route.slice(1)));
+        if (await file.exists()) return new Response(file, { headers: { 'Content-Type': route.endsWith('.css') ? 'text/css; charset=utf-8' : 'text/javascript; charset=utf-8', 'Cache-Control': 'no-store' } });
+      }
       if (route === '/api/config' && method === 'GET') return json({ limits: config.limits, trash: !!config.trash });
       if (route === '/api/list' && method === 'GET') return json(await files.list(p()));
       if (route === '/api/metadata' && method === 'GET') return json(await files.describe(p()));
