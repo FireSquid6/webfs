@@ -21,6 +21,8 @@ type Config = { limits: { edit: number; preview: number; upload: number }; trash
 type ApiProblem = Error & { code?: string; details?: { version?: string; path?: string } };
 const url = (route: string, path: string) => `${route}?path=${encodeURIComponent(path)}`;
 const raw = (path: string) => url('/api/raw', path);
+const media = /\.(pdf|png|jpe?g|gif|webp|svg|bmp|avif|ico)$/i;
+const markdownFile = /\.md(?:own)?$/i;
 const join = (parent: string, name: string) => parent ? `${parent}/${name}` : name;
 const parentOf = (path: string) => path.split('/').slice(0, -1).join('/');
 const nameOf = (path: string) => path.split('/').at(-1) || 'Root';
@@ -67,6 +69,7 @@ function App() {
   const [version, setVersion] = useState('');
   const [editing, setEditing] = useState(false);
   const [preview, setPreview] = useState(false);
+  const [previewAllowed, setPreviewAllowed] = useState(false);
   const [serverCopy, setServerCopy] = useState<string | null>(null);
   const [message, setMessage] = useState('');
   const [dialog, setDialog] = useState<'create' | 'rename' | 'move' | 'delete' | 'restore' | 'purge' | 'shortcuts' | 'conflict' | null>(null);
@@ -89,6 +92,19 @@ function App() {
   const mayLeave = () => !dirty || window.confirm('Discard unsaved changes?');
   const navigate = async (path: string) => { if (!mayLeave()) return; try { await list(path); setSelected(null); setTrash(null); setFilter(''); setEditing(false); setMessage(''); } catch (problem) { error(problem); } };
   const showTrash = async () => { if (!mayLeave()) return; try { setTrash(await api<TrashEntry[]>('/api/trash')); setSelected(null); setMessage(''); } catch (problem) { error(problem); } };
+  const checkMediaPreview = async (entry: Entry): Promise<boolean> => {
+    if (entry.kind !== 'symlink' && config && entry.size > config.limits.preview) { setMessage('This file exceeds the preview limit. Download remains available.'); return false; }
+    try {
+      const response = await fetch(url('/api/preview', entry.path), { cache: 'no-store' });
+      if (!response.ok) {
+        const problem = await response.json() as { error?: { message?: string } };
+        setMessage(response.status === 413 ? `Preview limit exceeded: ${problem.error?.message || 'file is too large'}. Download remains available.` : `${problem.error?.message || `Preview unavailable (HTTP ${response.status})`}. Download remains available.`);
+        return false;
+      }
+      await response.body?.cancel();
+      return true;
+    } catch (problem) { error(problem); return false; }
+  };
   const open = async (entry: Entry) => {
     if (entry.link?.outside || entry.link?.dangling) { setMessage(`Cannot open link → ${entry.link.target} (${entry.link.outside ? 'outside root' : 'unavailable'}).`); return; }
     if (entry.kind === 'directory' || entry.kind === 'symlink') {
@@ -97,18 +113,23 @@ function App() {
       catch (problem) { if (entry.kind === 'directory') { error(problem); return; } }
     }
     if (!mayLeave()) return;
-    setSelected(entry); setEditing(false); setPreview(false); setServerCopy(null); setMessage('');
-    if (/\.md(?:own)?$/i.test(entry.name)) {
-      try { const text = await api<{ content: string; version: string }>(url('/api/text', entry.path)); setContent(text.content); setSaved(text.content); setVersion(text.version); setEditing(true); return; }
-      catch (problem) { if ((problem as ApiProblem).code !== 'SIZE_LIMIT') { error(problem); return; } }
-      try { const text = await api<{ content: string }>(url('/api/text-preview', entry.path)); setContent(text.content); setSaved(text.content); setPreview(true); setMessage('This file exceeds the editing limit; preview is read-only.'); } catch (problem) { error(problem); }
-    } else if (/\.(pdf|png|jpe?g|gif|webp|svg|bmp|avif|ico)$/i.test(entry.name)) {
-      if (entry.size > (config?.limits.preview ?? 0)) setMessage('This file exceeds the preview limit. Download remains available.');
-      else setPreview(true);
-    } else {
-      try { const text = await api<{ content: string; version: string }>(url('/api/text', entry.path)); setContent(text.content); setSaved(text.content); setVersion(text.version); setEditing(true); }
-      catch (problem) { setMessage(`${(problem as Error).message}. Download remains available.`); }
+    setSelected(entry); setEditing(false); setPreview(false); setPreviewAllowed(false); setServerCopy(null); setMessage('');
+    try {
+      const text = await api<{ content: string; version: string }>(url('/api/text', entry.path));
+      setContent(text.content); setSaved(text.content); setVersion(text.version); setEditing(true);
+    } catch (problem) {
+      if (markdownFile.test(entry.name) && (problem as ApiProblem).code === 'SIZE_LIMIT') {
+        try { const text = await api<{ content: string }>(url('/api/text-preview', entry.path)); setContent(text.content); setSaved(text.content); setPreview(true); setMessage('This file exceeds the editing limit; preview is read-only.'); } catch (failure) { error(failure); }
+      } else if (media.test(entry.name)) {
+        if (await checkMediaPreview(entry)) { setPreviewAllowed(true); setPreview(true); }
+      } else setMessage(`${(problem as Error).message}. Download remains available.`);
     }
+  };
+  const togglePreview = async () => {
+    if (!selected) return;
+    if (preview) { setPreview(false); return; }
+    if (markdownFile.test(selected.name)) { setPreview(true); return; }
+    if (await checkMediaPreview(selected)) { setPreviewAllowed(true); setPreview(true); if (dirty) setMessage('Preview shows the saved server file, not your unsaved edits.'); }
   };
   const save = async (overwrite = false) => {
     if (!selected) return;
@@ -136,8 +157,9 @@ function App() {
   };
   const upload = async (files: FileList | null, overwrite = false) => {
     if (!files?.length) return;
-    const oversized = Array.from(files).filter(file => file.size > (config?.limits.upload ?? 0));
-    if (oversized.length) { setMessage(`Upload limit ${readable(config!.limits.upload)} per file exceeded: ${oversized.map(file => file.name).join(', ')}`); return; }
+    if (!config) { setMessage('Loading upload limits. Try again when the server configuration is available.'); return; }
+    const oversized = Array.from(files).filter(file => file.size > config.limits.upload);
+    if (oversized.length) { setMessage(`Upload limit ${readable(config.limits.upload)} per file exceeded: ${oversized.map(file => file.name).join(', ')}`); return; }
     const form = new FormData(); for (const file of files) form.append('files', file);
     try { await api(`${url('/api/upload', directory)}${overwrite ? '&overwrite=true' : ''}`, 'POST', form); await refresh(); setMessage(`${files.length} file(s) uploaded.`); }
     catch (problem) { if ((problem as ApiProblem).code === 'NAME_CONFLICT' && !overwrite && window.confirm('A filename already exists. Replace conflicting files or links in this upload?')) await upload(files, true); else error(problem); }
@@ -153,10 +175,20 @@ function App() {
     <main><div className="topline"><div><p className="eyebrow">{trash ? 'RECOVERY' : selected ? 'FILE VIEW' : 'EXPLORER'}</p><h1>{trash ? 'Trash' : selected ? selected.name : directory ? nameOf(directory) : 'Your files'}</h1></div><span className="connection" role="status">{message.includes('connect') || message.includes('connection') ? '● Offline' : '● Online only'}</span></div>
     {message && <div className="notice" role="alert">{message} <Button aria-label="Dismiss message" onPress={() => setMessage('')}>×</Button></div>}
     {!trash && <nav className="breadcrumbs" aria-label="Breadcrumb"><Button onPress={() => navigate('')}>Root</Button>{crumb.filter(Boolean).map((part, index) => <React.Fragment key={index}><span aria-hidden="true">/</span><Button onPress={() => navigate(crumb.slice(0, index + 1).join('/'))}>{part}</Button></React.Fragment>)}</nav>}
-    {trash ? <section className="panel"><div className="toolbar"><h2>Deleted items</h2><Button onPress={refresh}>Refresh</Button></div>{!trash.length ? <p className="empty">Trash is empty.</p> : <ul className="items">{trash.map(item => <li key={item.id}><div className="item-main"><span className="glyph">♻</span><div><strong>{item.original}</strong><small>{item.kind} · {readable(item.size)} · deleted {new Date(item.deletedAt).toLocaleString()}</small></div></div><div className="actions"><Button onPress={() => { setTrashed(item); setDraft(item.original); setDialog('restore'); }}>Restore</Button><Button onPress={() => { setTrashed(item); setDialog('purge'); }}>Permanently delete</Button></div></li>)}</ul>}</section> : selected ? <section className="panel"><div className="toolbar"><Button onPress={() => navigate(directory)}>← Back to folder</Button><a className="button" href={raw(selected.path)} download>Download</a></div><div className="file-heading"><span className="glyph">▤</span><div><h2>{selected.name}{dirty ? ' • Unsaved' : ''}</h2><p>{readable(selected.size)} · {new Date(selected.modified).toLocaleString()}</p></div></div>
-      {editing && <><div className="toolbar"><Button onPress={() => save()} isDisabled={!dirty}>Save changes</Button><label className="toggle"><input type="checkbox" checked={vimMode} onChange={event => setVimMode(event.target.checked)} /> Vim mode</label>{/\.md(?:own)?$/i.test(selected.name) && <Button onPress={() => setPreview(!preview)}>{preview ? 'Edit' : 'Preview Markdown'}</Button>}</div>{preview ? <article className="markdown" dangerouslySetInnerHTML={{ __html: marked.parse(content, { async: false }) as string }} /> : <Editor value={saved} onChange={setContent} name={selected.name} vimMode={vimMode} />}</>}
-      {!editing && preview && (/\.md(?:own)?$/i.test(selected.name) ? <article className="markdown" dangerouslySetInnerHTML={{ __html: marked.parse(content, { async: false }) as string }} /> : /\.pdf$/i.test(selected.name) ? <iframe title={`PDF preview: ${selected.name}`} src={url('/api/preview', selected.path)} className="pdf" /> : <img className="image-preview" alt={`Preview of ${selected.name}`} src={url('/api/preview', selected.path)} />)}
-      </section> : <section className="panel"><div className="toolbar wrap"><div className="toolbar"><Button onPress={() => { setCreateKind('file'); begin('create'); }}>+ File</Button><Button onPress={() => { setCreateKind('directory'); begin('create'); }}>+ Folder</Button><Button onPress={() => uploadInput.current?.click()}>↑ Upload files</Button><input ref={uploadInput} type="file" multiple aria-label="Choose files to upload" onChange={event => upload(event.target.files)} /></div><Button onPress={refresh}>↻ Refresh</Button></div><div className="controls"><label>Filter names <input value={filter} onChange={event => setFilter(event.target.value)} placeholder="This folder only" /></label><label>Sort by <select value={sort} onChange={event => setSort(event.target.value)}><option value="recent">Recently modified</option><option value="name">Name A–Z</option><option value="size">Largest first</option></select></label><label className="toggle"><input type="checkbox" checked={hidden} onChange={event => setHidden(event.target.checked)} /> Show hidden files</label></div><div className="list-title"><h2>Contents</h2><span>{visible.length} item{visible.length === 1 ? '' : 's'}</span></div>{!visible.length ? <p className="empty">No files to show in this folder.</p> : <ul className="items">{visible.map(entry => <li key={entry.path}><div className="item-main"><span className="glyph" aria-hidden="true">{entry.kind === 'directory' ? '▰' : entry.kind === 'symlink' ? '↗' : '▤'}</span><div><Button className="entry-name" onPress={() => open(entry)}>{entry.name}</Button><small>{entry.kind === 'symlink' ? `Link → ${entry.link?.target} · ${entry.link?.outside ? 'OUTSIDE ROOT · cannot open' : entry.link?.dangling ? 'unavailable · cannot open' : 'inside root'}` : `${entry.kind} · ${readable(entry.size)} · ${new Date(entry.modified).toLocaleString()}`}</small></div></div><div className="actions"><Button aria-label={`Rename ${entry.name}`} onPress={() => begin('rename', entry)}>Rename</Button><Button aria-label={`Move ${entry.name}`} onPress={() => { setMoving(entry); pick(directory); setDialog('move'); }}>Move</Button><Button aria-label={`Delete ${entry.name}`} onPress={() => begin('delete', entry)}>Delete</Button>{entry.kind !== 'directory' && !entry.link?.outside && !entry.link?.dangling && <a className="button" href={raw(entry.path)} download aria-label={`Download ${entry.name}`}>↓</a>}</div></li>)}</ul>}</section>}
+    {trash ? <section className="panel"><div className="toolbar"><h2>Deleted items</h2><Button onPress={refresh}>Refresh</Button></div>{!trash.length ? <p className="empty">Trash is empty.</p> : <ul className="items">{trash.map(item => <li key={item.id}><div className="item-main"><span className="glyph">♻</span><div><strong>{item.original}</strong><small>{item.kind} · {readable(item.size)} · deleted {new Date(item.deletedAt).toLocaleString()}</small></div></div><div className="actions"><Button aria-label={`Restore ${item.original}`} onPress={() => { setTrashed(item); setDraft(item.original); setDialog('restore'); }}>Restore</Button><Button aria-label={`Permanently delete ${item.original}`} onPress={() => { setTrashed(item); setDialog('purge'); }}>Permanently delete</Button></div></li>)}</ul>}</section> : selected ? <section className="panel"><div className="toolbar"><Button onPress={() => navigate(directory)}>← Back to folder</Button><a className="button" href={raw(selected.path)} download>Download</a></div><div className="file-heading"><span className="glyph">▤</span><div><h2>{selected.name}{dirty ? ' • Unsaved' : ''}</h2><p>{readable(selected.size)} · {new Date(selected.modified).toLocaleString()}</p></div></div>
+      {editing && <><div className="toolbar"><Button onPress={() => save()} isDisabled={!dirty}>Save changes</Button><label className="toggle"><input type="checkbox" checked={vimMode} onChange={event => setVimMode(event.target.checked)} /> Vim mode</label>{(markdownFile.test(selected.name) || media.test(selected.name)) && <Button onPress={togglePreview}>{preview ? 'Edit' : markdownFile.test(selected.name) ? 'Preview Markdown' : 'Preview saved file'}</Button>}</div><div hidden={preview}><Editor key={selected.path} value={content} onChange={setContent} name={selected.name} vimMode={vimMode} /></div>{preview && (markdownFile.test(selected.name) ? <article className="markdown" dangerouslySetInnerHTML={{ __html: marked.parse(content, { async: false }) as string }} /> : previewAllowed && ( /\.pdf$/i.test(selected.name) ? <iframe title={`PDF preview: ${selected.name}`} src={url('/api/preview', selected.path)} className="pdf" /> : <img className="image-preview" alt={`Preview of ${selected.name}`} src={url('/api/preview', selected.path)} /> ))}</>}
+      {!editing && preview && (markdownFile.test(selected.name) ? <article className="markdown" dangerouslySetInnerHTML={{ __html: marked.parse(content, { async: false }) as string }} /> : previewAllowed && (/\.pdf$/i.test(selected.name) ? <iframe title={`PDF preview: ${selected.name}`} src={url('/api/preview', selected.path)} className="pdf" /> : <img className="image-preview" alt={`Preview of ${selected.name}`} src={url('/api/preview', selected.path)} />))}
+      </section> : <section className="panel">
+        <div className="toolbar wrap"><div className="toolbar">
+          <Button onPress={() => { setCreateKind('file'); begin('create'); }}>+ File</Button>
+          <Button onPress={() => { setCreateKind('directory'); begin('create'); }}>+ Folder</Button>
+          <Button isDisabled={!config} onPress={() => uploadInput.current?.click()}>↑ Upload files</Button>
+          <input ref={uploadInput} type="file" multiple tabIndex={-1} aria-label="Choose files to upload" onChange={event => upload(event.target.files)} />
+        </div><Button onPress={refresh}>↻ Refresh</Button></div>
+        <div className="controls"><label>Filter names <input value={filter} onChange={event => setFilter(event.target.value)} placeholder="This folder only" /></label><label>Sort by <select value={sort} onChange={event => setSort(event.target.value)}><option value="recent">Recently modified</option><option value="name">Name A–Z</option><option value="size">Largest first</option></select></label><label className="toggle"><input type="checkbox" checked={hidden} onChange={event => setHidden(event.target.checked)} /> Show hidden files</label></div>
+        <div className="list-title"><h2>Contents</h2><span>{visible.length} item{visible.length === 1 ? '' : 's'}</span></div>
+        {!visible.length ? <p className="empty">No files to show in this folder.</p> : <ul className="items">{visible.map(entry => <li key={entry.path}><div className="item-main"><span className="glyph" aria-hidden="true">{entry.kind === 'directory' ? '▰' : entry.kind === 'symlink' ? '↗' : '▤'}</span><div><Button className="entry-name" onPress={() => open(entry)}>{entry.name}</Button><small>{entry.kind === 'symlink' ? `Link → ${entry.link?.target} · ${entry.link?.outside ? 'OUTSIDE ROOT · cannot open' : entry.link?.dangling ? 'unavailable · cannot open' : 'inside root'}` : `${entry.kind} · ${readable(entry.size)} · ${new Date(entry.modified).toLocaleString()}`}</small></div></div><div className="actions"><Button aria-label={`Rename ${entry.name}`} onPress={() => begin('rename', entry)}>Rename</Button><Button aria-label={`Move ${entry.name}`} onPress={() => { setMoving(entry); pick(directory); setDialog('move'); }}>Move</Button><Button aria-label={`Delete ${entry.name}`} onPress={() => begin('delete', entry)}>Delete</Button>{entry.kind !== 'directory' && !entry.link?.outside && !entry.link?.dangling && <a className="button" href={raw(entry.path)} download aria-label={`Download ${entry.name}`}>↓</a>}</div></li>)}</ul>}
+      </section>}
     <footer>Files stay on your server · No offline storage · <Button onPress={() => setDialog('shortcuts')}>Keyboard shortcuts</Button></footer></main>
     <ModalOverlay isOpen={dialog !== null} onOpenChange={open => { if (!open) setDialog(null); }} isDismissable><Modal><Dialog className="dialog" aria-label={dialog || 'Dialog'}><Heading slot="title">{({ create: `Create ${createKind}`, rename: 'Rename', move: 'Move to folder', delete: 'Delete item?', restore: 'Restore from trash', purge: 'Delete permanently?', shortcuts: 'Keyboard reference', conflict: 'Server version changed' } as Record<string, string>)[dialog || '']}</Heading>
       {message && <p role="alert" className="dialog-notice">{message}</p>}
